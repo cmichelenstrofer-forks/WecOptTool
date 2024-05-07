@@ -859,7 +859,7 @@ class WEC:
             :py:class:`xarray.Dataset` with the structure and elements
             shown by :py:mod:`wecopttool.waves`.
         nsubsteps
-            Number of steps between the default (implied) time steps.
+            Number  of steps between the default (implied) time steps.
             A value of :python:`1` corresponds to the default step
             length.
 
