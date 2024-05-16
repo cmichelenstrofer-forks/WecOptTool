@@ -64,12 +64,13 @@ from numpy.typing import ArrayLike
 import autograd.numpy as np
 from autograd.numpy import ndarray
 from autograd.builtins import isinstance, tuple, list, dict
-from autograd import grad, jacobian
+from autograd import grad, jacobian, hessian
 import xarray as xr
 from xarray import DataArray, Dataset
 import capytaine as cpy
-from scipy.optimize import minimize, OptimizeResult, Bounds
 from scipy.linalg import block_diag, dft
+import pyrol as rol
+import pyrol.vectors
 
 
 # logger
@@ -608,13 +609,9 @@ class WEC:
         scale_x_wec: Optional[list] = None,
         scale_x_opt: Optional[FloatOrArray] = 1.0,
         scale_obj: Optional[float] = 1.0,
-        optim_options: Optional[Mapping[str, Any]] = {},
-        use_grad: Optional[bool] = True,
+        parameter_file: str = "parameters.xml",
         maximize: Optional[bool] = False,
-        bounds_wec: Optional[Bounds] = None,
-        bounds_opt: Optional[Bounds] = None,
-        callback: Optional[TStateFunction] = None,
-        ) -> list[OptimizeResult]:
+        ) -> list:  # TODO list[???]
         """Simulate WEC dynamics using a pseudo-spectral solution
         method and returns the raw results dictionary produced by
         :py:func:`scipy.optimize.minimize`.
@@ -647,38 +644,17 @@ class WEC:
         scale_obj
             Factor to scale :python:`obj_fun` by, to improve
             convergence.
-        optim_options
-            Optimization options passed to the optimizer.
-            See :py:func:`scipy.optimize.minimize`.
-        use_grad
-             If :python:`True`, optimization will utilize
-             `autograd <https://github.com/HIPS/autograd>`_
-             for gradients.
+        parameter_file
+            File (xml) containing the ROL parameters.
         maximize
             Whether to maximize the objective function.
             The default is to minimize the objective function.
-        bounds_wec
-            Bounds on the WEC components of the decision variable.
-            See :py:func:`scipy.optimize.minimize`.
-        bounds_opt
-            Bounds on the optimization (control) components of the
-            decision variable.
-            See :py:func:`scipy.optimize.minimize`.
-        callback
-            Function called after each iteration, must have signature
-            :python:`fun(wec, x_wec, x_opt, waves)`. The default
-            provides status reports at each iteration via logging at the
-            INFO level.
 
         Raises
         ------
         ValueError
             If :python:`scale_x_opt` is a scalar and
             :python:`nstate_opt` is not provided.
-        Exception
-            If the optimizer fails for any reason other than maximum
-            number of states, i.e. for exit modes other than 0 or 9.
-            See :py:mod:`scipy.optimize` for exit mode details.
 
         Examples
         --------
@@ -706,6 +682,7 @@ class WEC:
 
         results = []
 
+        ## SCALING
         # x_wec scaling vector
         if scale_x_wec is None:
             scale_x_wec = [1.0] * self.ndof
@@ -723,6 +700,7 @@ class WEC:
         # composite scaling vector
         scale = np.concatenate([scale_x_wec, scale_x_opt])
 
+        ## INITIAL STATE
         # decision variable initial guess
         if x_wec_0 is None:
             x_wec_0 = np.random.randn(self.nstate_wec)
@@ -730,112 +708,85 @@ class WEC:
             x_opt_0 = np.random.randn(nstate_opt)
         x0 = np.concatenate([x_wec_0, x_opt_0])*scale
 
-        # bounds
-        if (bounds_wec is None) and (bounds_opt is None):
-            bounds = None
-        else:
-            bounds_in = [bounds_wec, bounds_opt]
-            for idx, bii in enumerate(bounds_in):
-                if isinstance(bii, tuple):
-                    bounds_in[idx] = Bounds(lb=[xibs[0] for xibs in bii],
-                                            ub=[xibs[1] for xibs in bii])
-            inf_wec = np.ones(self.nstate_wec)*np.inf
-            inf_opt = np.ones(nstate_opt)*np.inf
-            bounds_dflt = [Bounds(lb=-inf_wec, ub=inf_wec),
-                            Bounds(lb=-inf_opt, ub=inf_opt)]
-            bounds_list = []
-            for bi, bd in zip(bounds_in, bounds_dflt):
-                if bi is not None:
-                    bo = bi
-                else:
-                    bo = bd
-                bounds_list.append(bo)
-            bounds = Bounds(lb=np.hstack([le.lb for le in bounds_list])*scale,
-                            ub=np.hstack([le.ub for le in bounds_list])*scale)
-
+        ## SOLVE OPTIMIZATION PROBLEM
         for realization, wave in waves.groupby('realization'):
 
             _log.info("Solving pseudo-spectral control problem "
                       + f"for realization number {realization}.")
 
             # objective function
-            sign = -1.0 if maximize else 1.0
+            class Objective(rol.Objective):
+                def __init__(ObjSelf):
+                    super().__init__()
+                    def obj(x):
+                        x_wec, x_opt = self.decompose_state(x)  # x_wec, x_opt = self.decompose_state(x/scale)
+                        sign = -1.0 if maximize else 1.0
+                        return obj_fun(self, x_wec, x_opt, wave)*sign
+                    ObjSelf.obj = obj
 
-            def obj_fun_scaled(x):
-                x_wec, x_opt = self.decompose_state(x/scale)
-                return obj_fun(self, x_wec, x_opt, wave)*scale_obj*sign
+                def value(ObjSelf, x, tol=None):
+                    return ObjSelf.obj(x) * scale_obj # ObjSelf.obj(x) * scale_obj
 
-            # constraints
-            constraints = self.constraints.copy()
+                def gradient(ObjSelf, g, x, tol=None):
+                    g[:] = (jacobian(ObjSelf.obj))(x)
+                    return None
 
-            for i, icons in enumerate(self.constraints):
-                icons_new = {"type": icons["type"]}
+                def hessVec(ObjSelf, hv, v, x, tol=None):
+                    h = (hessian(ObjSelf.obj))(x)
+                    hv[:] = np.dot(h, v)
+                    return None
 
-                def make_new_fun(icons):
-                    def new_fun(x):
-                        x_wec, x_opt = self.decompose_state(x/scale)
-                        return icons["fun"](self, x_wec, x_opt, wave)
-                    return new_fun
+            class EquationsOfMotion(rol.Constraint):
+                def __init__(ObjSelf):
+                    super().__init__()
+                    def residual(x):
+                        # x_s = x/scale
+                        x_wec, x_opt = self.decompose_state(x) # x_wec, x_opt = self.decompose_state(x_s)
+                        return self.residual(x_wec, x_opt, wave)
 
-                icons_new["fun"] = make_new_fun(icons)
-                if use_grad:
-                    icons_new['jac'] = jacobian(icons_new['fun'])
-                constraints[i] = icons_new
+                    ObjSelf.residual = residual
+                    ObjSelf.jacobian = lambda x: jacobian(ObjSelf.residual(x))
 
-            # system dynamics through equality constraint, ma - Σf = 0
-            def scaled_resid_fun(x):
-                x_s = x/scale
-                x_wec, x_opt = self.decompose_state(x_s)
-                return self.residual(x_wec, x_opt, wave)
+                def value(ObjSelf, c, x, tol=None):
+                    c[:] = ObjSelf.residual(x)
+                    return None
 
-            eq_cons = {'type': 'eq', 'fun': scaled_resid_fun}
-            if use_grad:
-                eq_cons['jac'] = jacobian(scaled_resid_fun)
-            constraints.append(eq_cons)
+                def applyJacobian(ObjSelf, jv, v, x, tol=None):
+                    jv[:] = np.dot(ObjSelf.jacobian(x), v)
+                    return None
 
-            # callback
-            if callback is None:
-                def callback_scipy(x):
-                    x_wec, x_opt = self.decompose_state(x)
-                    max_x_opt = np.nan if np.size(x_opt)==0 else np.max(np.abs(x_opt))
-                    _log.info("Scaled [max(x_wec), max(x_opt), obj_fun(x)]: "
-                              + f"[{np.max(np.abs(x_wec)):.2e}, "
-                              + f"{max_x_opt:.2e}, "
-                              + f"{obj_fun_scaled(x):.2e}]")
-            else:
-                def callback_scipy(x):
-                    x_s = x/scale
-                    x_wec, x_opt = self.decompose_state(x_s)
-                    return callback(self, x_wec, x_opt, wave)
+                def applyAdjointJacobian(ObjSelf, ajv, v, x, tol=None):
+                    ajv[:] = np.dot(np.transpose(ObjSelf.jacobian(x)), v)
+                    return None
 
-            # optimization problem
-            optim_options['disp'] = optim_options.get('disp', True)
-            problem = {'fun': obj_fun_scaled,
-                        'x0': x0,
-                        'method': 'SLSQP',
-                        'constraints': constraints,
-                        'options': optim_options,
-                        'bounds': bounds,
-                        'callback': callback_scipy,
-                        }
-            if use_grad:
-                problem['jac'] = grad(obj_fun_scaled)
+            # Configure parameter list.  ################
+            params = rol.getParametersFromXmlFile(parameter_file)
+            params['General'] = rol.getParametersFromXmlFile(parameter_file)
+            params['General']['Output Level'] = 1
+            # Set the output stream.  ###################
+            stream = rol.getCout()
 
-            # minimize
-            optim_res = minimize(**problem)
+            # Create predictors.  #######################
+            x = rol.vectors.NumPyVector(x0)
+            c = rol.vectors.NumPyVector(np.zeros(self.ncomponents,))
+            g = x.dual()  # gradient with respect to x
 
-            msg = f'{optim_res.message}    (Exit mode {optim_res.status})'
-            if optim_res.status == 0:
-                _log.info(msg)
-            elif optim_res.status == 9:
-                _log.warning(msg)
-            else:
-                raise Exception(msg)
+            # Create the problem  ##############
+            objective = Objective()
+            constraint = EquationsOfMotion()
+
+            problem = rol.Problem(objective, x, g)
+            problem.addConstraint('dynamics', constraint, c)
+            problem.check(True, stream)
+
+            # Solve.  ###################################
+            solver = rol.Solver(problem, params)
+            solver.solve(stream)
 
             # unscale
-            optim_res.x = optim_res.x / scale
-            optim_res.fun = optim_res.fun / scale_obj
-            optim_res.jac = optim_res.jac / scale_obj * scale
+            optim_res = {}
+            optim_res['x'] = x.array # / scale
+            optim_res['f'] = objective.value(x, None) # / scale_obj
 
             results.append(optim_res)
 
@@ -859,7 +810,7 @@ class WEC:
             :py:class:`xarray.Dataset` with the structure and elements
             shown by :py:mod:`wecopttool.waves`.
         nsubsteps
-            Number  of steps between the default (implied) time steps.
+            Number of steps between the default (implied) time steps.
             A value of :python:`1` corresponds to the default step
             length.
 
