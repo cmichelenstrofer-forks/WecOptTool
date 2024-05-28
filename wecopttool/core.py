@@ -725,38 +725,37 @@ class WEC:
                     ObjSelf.obj = obj
 
                 def value(ObjSelf, x, tol=None):
-                    return ObjSelf.obj(x) * scale_obj # ObjSelf.obj(x) * scale_obj
+                    return ObjSelf.obj(x.array) * scale_obj
 
                 def gradient(ObjSelf, g, x, tol=None):
-                    g[:] = (jacobian(ObjSelf.obj))(x)
+                    g[:] = (jacobian(ObjSelf.obj))(x.array)
                     return None
 
                 def hessVec(ObjSelf, hv, v, x, tol=None):
-                    h = (hessian(ObjSelf.obj))(x)
-                    hv[:] = np.dot(h, v)
+                    h = (hessian(ObjSelf.obj))(x.array)
+                    hv[:] = np.dot(h, v.array)
                     return None
 
             class EquationsOfMotion(rol.Constraint):
                 def __init__(ObjSelf):
                     super().__init__()
                     def residual(x):
-                        # x_s = x/scale
-                        x_wec, x_opt = self.decompose_state(x) # x_wec, x_opt = self.decompose_state(x_s)
+                        x_wec, x_opt = self.decompose_state(x)
                         return self.residual(x_wec, x_opt, wave)
 
                     ObjSelf.residual = residual
-                    ObjSelf.jacobian = lambda x: jacobian(ObjSelf.residual(x))
+                    ObjSelf.jacobian = lambda x: jacobian(ObjSelf.residual)(x.array)
 
                 def value(ObjSelf, c, x, tol=None):
-                    c[:] = ObjSelf.residual(x)
+                    c[:] = ObjSelf.residual(x.array)
                     return None
 
                 def applyJacobian(ObjSelf, jv, v, x, tol=None):
-                    jv[:] = np.dot(ObjSelf.jacobian(x), v)
+                    jv[:] = np.dot(ObjSelf.jacobian(x), v.array)
                     return None
 
                 def applyAdjointJacobian(ObjSelf, ajv, v, x, tol=None):
-                    ajv[:] = np.dot(np.transpose(ObjSelf.jacobian(x)), v)
+                    ajv[:] = np.dot(np.transpose(ObjSelf.jacobian(x)), v.array)
                     return None
 
             # Configure parameter list.  ################
