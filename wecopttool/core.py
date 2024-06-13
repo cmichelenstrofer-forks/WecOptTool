@@ -64,7 +64,7 @@ from numpy.typing import ArrayLike
 import autograd.numpy as np
 from autograd.numpy import ndarray
 from autograd.builtins import isinstance, tuple, list, dict
-from autograd import grad, jacobian, hessian
+from autograd import grad, hessian_vector_product, make_jvp, vector_jacobian_product
 import xarray as xr
 from xarray import DataArray, Dataset
 import capytaine as cpy
@@ -716,52 +716,52 @@ class WEC:
 
             # objective function
             class Objective(rol.Objective):
-                def __init__(ObjSelf):
-                    super().__init__()
-                    def obj(x):
-                        x_wec, x_opt = self.decompose_state(x)  # x_wec, x_opt = self.decompose_state(x/scale)
-                        sign = -1.0 if maximize else 1.0
-                        return obj_fun(self, x_wec, x_opt, wave)*sign
-                    ObjSelf.obj = obj
+
+                def _value(ObjSelf, x_np):
+                    x_wec, x_opt = self.decompose_state(x_np)  # x_wec, x_opt = self.decompose_state(x/scale)
+                    sign = -1.0 if maximize else 1.0
+                    return obj_fun(self, x_wec, x_opt, wave)*sign*scale_obj
 
                 def value(ObjSelf, x, tol=None):
-                    return ObjSelf.obj(x.array) * scale_obj
+                    return ObjSelf._value(x[:])
 
                 def gradient(ObjSelf, g, x, tol=None):
-                    g[:] = (jacobian(ObjSelf.obj))(x.array)
+                    g[:] = grad(ObjSelf._value)(x[:])
                     return None
 
                 def hessVec(ObjSelf, hv, v, x, tol=None):
-                    h = (hessian(ObjSelf.obj))(x.array)
-                    hv[:] = np.dot(h, v.array)
+                    hv[:] = hessian_vector_product(ObjSelf._value)(x[:],v[:])
                     return None
 
             class EquationsOfMotion(rol.Constraint):
+
                 def __init__(ObjSelf):
                     super().__init__()
-                    def residual(x):
-                        x_wec, x_opt = self.decompose_state(x)
-                        return self.residual(x_wec, x_opt, wave)
+                    ObjSelf._apply_adjoint_jacobian = vector_jacobian_product(ObjSelf._value)
 
-                    ObjSelf.residual = residual
-                    ObjSelf.jacobian = lambda x: jacobian(ObjSelf.residual)(x.array)
+                def _value(ObjSelf, x_np):
+                    x_wec, x_opt = self.decompose_state(x_np)
+                    return self.residual(x_wec, x_opt, wave)
 
                 def value(ObjSelf, c, x, tol=None):
-                    c[:] = ObjSelf.residual(x.array)
+                    c[:] = ObjSelf._value(x[:])
                     return None
 
                 def applyJacobian(ObjSelf, jv, v, x, tol=None):
-                    jv[:] = np.dot(ObjSelf.jacobian(x), v.array)
+                    jv[:] = make_jvp(ObjSelf._value)(x[:])(v[:])[1]
+                    # raise Exception
                     return None
 
                 def applyAdjointJacobian(ObjSelf, ajv, v, x, tol=None):
-                    ajv[:] = np.dot(np.transpose(ObjSelf.jacobian(x)), v.array)
+                    ajv[:] = ObjSelf._apply_adjoint_jacobian(x[:], v[:])
                     return None
 
             # Configure parameter list.  ################
-            params = rol.getParametersFromXmlFile(parameter_file)
-            params['General'] = rol.getParametersFromXmlFile(parameter_file)
+            params = rol.pyrol.Teuchos.ParameterList()
+            params['General'] = rol.pyrol.Teuchos.ParameterList()
             params['General']['Output Level'] = 1
+            params['Step'] = rol.pyrol.Teuchos.ParameterList()
+            params['Step']['Type'] = 'Composite Step'
             # Set the output stream.  ###################
             stream = rol.getCout()
 
