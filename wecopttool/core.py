@@ -575,7 +575,8 @@ class WEC:
                   inertia_in_forces=True, ndof=shape[1])
         return wec
 
-    def residual(self, x_wec: ndarray, x_opt: ndarray, waves: Dataset,
+    @staticmethod
+    def residual(wec, x_wec: ndarray, x_opt: ndarray, waves: Dataset,
         ) -> float:
         """
         Return the residual of the dynamic equation (r = m⋅a-Σf).
@@ -590,14 +591,42 @@ class WEC:
             :py:class:`xarray.Dataset` with the structure and elements
             shown by :py:mod:`wecopttool.waves`.
         """
-        if not self.inertia_in_forces:
-            ri = self.inertia(self, x_wec, x_opt, waves)
+        if not wec.inertia_in_forces:
+            ri = wec.inertia(wec, x_wec, x_opt, waves)
         else:
-            ri = np.zeros([self.ncomponents, self.ndof])
+            ri = np.zeros([wec.ncomponents, wec.ndof])
         # forces, -Σf
-        for f in self.forces.values():
-            ri = ri - f(self, x_wec, x_opt, waves)
-        return self.dofmat_to_vec(ri)
+        for f in wec.forces.values():
+            ri = ri - f(wec, x_wec, x_opt, waves)
+        return wec.dofmat_to_vec(ri)
+
+    # constraints
+    def create_constraint(self, func, wave):
+        c = rol.vectors.NumPyVector(np.zeros(self.ncomponents,))
+
+        class Constraint(rol.Constraint):
+
+            def __init__(ObjSelf):
+                super().__init__()
+                ObjSelf._apply_adjoint_jacobian = vector_jacobian_product(ObjSelf._value)
+
+            def _value(ObjSelf, x_np):
+                x_wec, x_opt = self.decompose_state(x_np)
+                return func(self, x_wec, x_opt, wave)
+
+            def value(ObjSelf, c, x, tol=None):
+                c[:] = ObjSelf._value(x[:])
+                return None
+
+            def applyJacobian(ObjSelf, jv, v, x, tol=None):
+                jv[:] = make_jvp(ObjSelf._value)(x[:])(v[:])[1]
+                return None
+
+            def applyAdjointJacobian(ObjSelf, ajv, v, x, tol=None):
+                ajv[:] = ObjSelf._apply_adjoint_jacobian(x[:], v[:])
+                return None
+
+        return c, Constraint()
 
     # solve
     def solve(self,
@@ -606,12 +635,7 @@ class WEC:
         nstate_opt: int,
         x_wec_0: Optional[ndarray] = None,
         x_opt_0: Optional[ndarray] = None,
-        scale_x_wec: Optional[list] = None,
-        scale_x_opt: Optional[FloatOrArray] = 1.0,
-        scale_obj: Optional[float] = 1.0,
-        parameter_file: str = "parameters.xml",
-        maximize: Optional[bool] = False,
-        ) -> list:  # TODO list[???]
+        ) -> list:
         """Simulate WEC dynamics using a pseudo-spectral solution
         method and returns the raw results dictionary produced by
         :py:func:`scipy.optimize.minimize`.
@@ -633,22 +657,6 @@ class WEC:
         x_opt_0
             Initial guess for the optimization (control) state.
             If :python:`None` it is randomly initiated.
-        scale_x_wec
-            Factor(s) to scale each DOF in :python:`x_wec` by, to
-            improve convergence.
-            A single float or an array of size :python:`ndof`.
-        scale_x_opt
-            Factor(s) to scale :python:`x_opt` by, to improve
-            convergence.
-            A single float or an array of size :python:`nstate_opt`.
-        scale_obj
-            Factor to scale :python:`obj_fun` by, to improve
-            convergence.
-        parameter_file
-            File (xml) containing the ROL parameters.
-        maximize
-            Whether to maximize the objective function.
-            The default is to minimize the objective function.
 
         Raises
         ------
@@ -682,31 +690,13 @@ class WEC:
 
         results = []
 
-        ## SCALING
-        # x_wec scaling vector
-        if scale_x_wec is None:
-            scale_x_wec = [1.0] * self.ndof
-        elif isinstance(scale_x_wec, float) or isinstance(scale_x_wec, int):
-            scale_x_wec = [scale_x_wec] * self.ndof
-        scale_x_wec = scale_dofs(scale_x_wec, self.ncomponents)
-
-        # x_opt scaling vector
-        if isinstance(scale_x_opt, float) or isinstance(scale_x_opt, int):
-            if nstate_opt is None:
-                raise ValueError("If 'scale_x_opt' is a scalar, " +
-                                    "'nstate_opt' must be provided")
-            scale_x_opt = scale_dofs([scale_x_opt], nstate_opt)
-
-        # composite scaling vector
-        scale = np.concatenate([scale_x_wec, scale_x_opt])
-
         ## INITIAL STATE
         # decision variable initial guess
         if x_wec_0 is None:
             x_wec_0 = np.random.randn(self.nstate_wec)
         if x_opt_0 is None:
             x_opt_0 = np.random.randn(nstate_opt)
-        x0 = np.concatenate([x_wec_0, x_opt_0])*scale
+        x0 = np.concatenate([x_wec_0, x_opt_0])
 
         ## SOLVE OPTIMIZATION PROBLEM
         for realization, wave in waves.groupby('realization'):
@@ -718,9 +708,8 @@ class WEC:
             class Objective(rol.Objective):
 
                 def _value(ObjSelf, x_np):
-                    x_wec, x_opt = self.decompose_state(x_np)  # x_wec, x_opt = self.decompose_state(x/scale)
-                    sign = -1.0 if maximize else 1.0
-                    return obj_fun(self, x_wec, x_opt, wave)*sign*scale_obj
+                    x_wec, x_opt = self.decompose_state(x_np)
+                    return obj_fun(self, x_wec, x_opt, wave)
 
                 def value(ObjSelf, x, tol=None):
                     return ObjSelf._value(x[:])
@@ -731,29 +720,6 @@ class WEC:
 
                 def hessVec(ObjSelf, hv, v, x, tol=None):
                     hv[:] = hessian_vector_product(ObjSelf._value)(x[:],v[:])
-                    return None
-
-            class EquationsOfMotion(rol.Constraint):
-
-                def __init__(ObjSelf):
-                    super().__init__()
-                    ObjSelf._apply_adjoint_jacobian = vector_jacobian_product(ObjSelf._value)
-
-                def _value(ObjSelf, x_np):
-                    x_wec, x_opt = self.decompose_state(x_np)
-                    return self.residual(x_wec, x_opt, wave)
-
-                def value(ObjSelf, c, x, tol=None):
-                    c[:] = ObjSelf._value(x[:])
-                    return None
-
-                def applyJacobian(ObjSelf, jv, v, x, tol=None):
-                    jv[:] = make_jvp(ObjSelf._value)(x[:])(v[:])[1]
-                    # raise Exception
-                    return None
-
-                def applyAdjointJacobian(ObjSelf, ajv, v, x, tol=None):
-                    ajv[:] = ObjSelf._apply_adjoint_jacobian(x[:], v[:])
                     return None
 
             # Configure parameter list.  ################
@@ -772,10 +738,12 @@ class WEC:
 
             # Create the problem  ##############
             objective = Objective()
-            constraint = EquationsOfMotion()
-
             problem = rol.Problem(objective, x, g)
-            problem.addConstraint('dynamics', constraint, c)
+            c_eom, equations_of_motion = self.create_constraint(self.residual, wave)
+            problem.addConstraint('dynamics', equations_of_motion, c_eom)
+            for i, func in enumerate(self.constraints):
+                c, constraint = self.create_constraint(func, wave)
+                problem.addConstraint(f"constraint_{i}", constraint, c)
             problem.check(True, stream)
 
             # Solve.  ###################################
@@ -783,10 +751,10 @@ class WEC:
             solver.solve(stream)
 
             # unscale
-            optim_res = {}
-            optim_res['x'] = x.array # / scale
-            optim_res['f'] = objective.value(x, None) # / scale_obj
-
+            optim_res = {
+                'x': x.array,
+                'f': objective.value(x, None),
+            }
             results.append(optim_res)
 
         return results

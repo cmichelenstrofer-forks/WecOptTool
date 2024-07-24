@@ -3,6 +3,8 @@ import capytaine as cpy
 import matplotlib.pyplot as plt
 
 import wecopttool as wot
+# import pyrol as rol
+# import pyrol.vectors
 
 plt.style.use('tableau-colorblind10')
 
@@ -39,7 +41,19 @@ pto = wot.pto.PTO(ndof, kinematics, controller, pto_impedance, loss, name)
 
 f_add = {'PTO': pto.force_on_wec}
 
-wec = wot.WEC.from_bem(bem_data, f_add=f_add)
+def const_f_pto(wec, x_wec, x_opt, waves): # Format for scipy.optimize.minimize
+    f_max = 750.0
+    nsubsteps = 1 # need to allow larger
+    f = pto.force_on_wec(wec, x_wec, x_opt, waves, nsubsteps)
+    return f_max - np.abs(f.flatten())
+
+# constraints = []
+constraints =  [const_f_pto,]
+
+
+wec = wot.WEC.from_bem(bem_data, f_add=f_add, constraints=constraints)
+
+
 
 obj_fun = pto.mechanical_average_power
 nstate_opt = 2*nfreq
